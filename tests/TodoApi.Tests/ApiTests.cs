@@ -11,7 +11,7 @@ public class ApiTests(WebApplicationFactory<Program> factory)
     : IClassFixture<WebApplicationFactory<Program>>
 {
     private readonly HttpClient _client = factory.CreateClient();
-
+    //test
     [Fact]
     public async Task Root_returns_app_info()
     {
