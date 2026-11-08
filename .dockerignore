@@ -1,0 +1,15 @@
+**/bin/
+**/obj/
+**/TestResults/
+tests/
+k8s/
+scripts/
+.github/
+.git/
+.vs/
+.vscode/
+.idea/
+*.md
+.env
+compose.yaml
+Dockerfile

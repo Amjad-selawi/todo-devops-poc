@@ -1,0 +1,22 @@
+# Ingress: expose the API on http://todo.localtest.me through an Ingress Controller.
+# Optional: needs an Ingress Controller installed in the cluster (e.g. Traefik).
+# Apply it after installing one:  kubectl apply -f k8s/optional/ingress.yaml
+# (*.localtest.me always resolves to 127.0.0.1, so no hosts-file edit is needed.)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: todo-api
+  namespace: todo
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: todo.localtest.me
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: todo-api
+                port:
+                  number: 80

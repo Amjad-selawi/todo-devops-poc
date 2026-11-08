@@ -1,0 +1,24 @@
+# HorizontalPodAutoscaler: adds Pods when average CPU > 60% of the request, removes them when it drops.
+# Needs metrics-server in the cluster (scripts/kind-up.sh installs it).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: todo-api
+  namespace: todo
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: todo-api
+  minReplicas: 3
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 60  # wait 1 minute of low load before removing Pods

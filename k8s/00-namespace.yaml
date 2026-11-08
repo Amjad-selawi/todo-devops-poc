@@ -1,0 +1,7 @@
+# A Namespace groups everything for this app, separate from other apps in the cluster.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: todo
+  labels:
+    app.kubernetes.io/part-of: todo-poc

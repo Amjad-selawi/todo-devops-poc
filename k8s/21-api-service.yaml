@@ -1,0 +1,16 @@
+# Service = one stable name/IP ("todo-api") that load-balances across all READY API Pods.
+apiVersion: v1
+kind: Service
+metadata:
+  name: todo-api
+  namespace: todo
+  labels:
+    app: todo-api
+spec:
+  type: ClusterIP
+  selector:
+    app: todo-api                     # every Pod with this label receives traffic
+  ports:
+    - name: http
+      port: 80                        # port of the Service
+      targetPort: http                # port inside the container (8080)

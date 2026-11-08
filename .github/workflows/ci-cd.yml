@@ -1,0 +1,225 @@
+# CI/CD pipeline for the POC
+#
+#   test ─┐
+#         ├─> build-image ─> deploy-test (real Kubernetes cluster inside the runner) ─> deploy-production (manual approval)
+#   lint ─┘
+#
+# Pull request : test + lint + build + scan + deploy-test        (nothing is pushed)
+# Push to main : the same, then push the image to GHCR, then wait for approval to deploy to production
+
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel an older run of the same branch when a new commit arrives
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_VERSION: "10.0.x"
+  KIND_CLUSTER: poc
+
+jobs:
+  # ─────────────────────────── 1. Unit tests ───────────────────────────
+  test:
+    name: Build & test (.NET)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet packages                     # restore is fast when no .csproj changed
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: Restore
+        run: dotnet restore TodoPoc.slnx
+
+      - name: Build
+        run: dotnet build TodoPoc.slnx --no-restore -c Release
+
+      - name: Test
+        run: >
+          dotnet test TodoPoc.slnx --no-build -c Release
+          --logger "trx;LogFileName=results.trx"
+          --collect:"XPlat Code Coverage"
+          --results-directory TestResults
+
+      - name: Upload test results
+        if: always()                                   # keep results even when tests fail
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: TestResults
+
+  # ─────────────── 2. Lint Dockerfile + validate Kubernetes YAML (runs in parallel with tests) ───────────────
+  lint:
+    name: Lint Dockerfile & K8s manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint Dockerfile (hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: error
+
+      - name: Validate Kubernetes manifests (kubeconform)
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz
+          kubectl kustomize k8s/ | ./kubeconform -strict -summary -
+          ./kubeconform -strict -summary k8s/optional/
+
+  # ─────────────── 3. Build the image once, scan it, push it (main only) ───────────────
+  build-image:
+    name: Build, scan & push image
+    needs: [test, lint]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write                                  # needed to push to ghcr.io
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image name and tag
+        id: meta
+        run: |
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"         # registry names must be lowercase
+          TAG="${GITHUB_SHA::7}"                       # tag = short commit SHA -> traceable
+          echo "image=ghcr.io/${OWNER}/todo-api:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true                                   # keep it in the local Docker for scanning
+          tags: ${{ steps.meta.outputs.image }}
+          build-args: APP_VERSION=${{ steps.meta.outputs.tag }}
+          cache-from: type=gha                         # reuse layers from previous runs
+          cache-to: type=gha,mode=max
+
+      - name: Scan image for vulnerabilities (Grype)
+        uses: anchore/scan-action@v6
+        with:
+          image: ${{ steps.meta.outputs.image }}
+          fail-build: true
+          severity-cutoff: critical                    # fail only on CRITICAL issues that have a fix
+          only-fixed: true
+          output-format: table
+
+      - name: Save image for the deploy job (build once, deploy many)
+        run: docker save "${{ steps.meta.outputs.image }}" -o image.tar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: image.tar
+          retention-days: 1
+
+      - name: Push image to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "${{ steps.meta.outputs.image }}"
+
+  # ─────────────── 4. Deploy to a real Kubernetes cluster created inside the runner ───────────────
+  deploy-test:
+    name: Deploy to test cluster (kind)
+    needs: build-image
+    runs-on: ubuntu-latest
+    environment: test
+    env:
+      IMAGE: ${{ needs.build-image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create Kubernetes cluster (kind)
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: ${{ env.KIND_CLUSTER }}
+          config: scripts/kind-config.yaml
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+
+      - name: Load the SAME image that was built and scanned
+        run: kind load image-archive image.tar --name "$KIND_CLUSTER"
+
+      - name: Deploy manifests
+        run: |
+          kubectl apply -k k8s/
+          kubectl -n todo set image deployment/todo-api api="$IMAGE"
+
+      - name: Wait for rollout
+        run: |
+          kubectl -n todo rollout status statefulset/postgres --timeout=180s
+          kubectl -n todo rollout status deployment/todo-api --timeout=240s
+          kubectl -n todo get pods -o wide
+
+      - name: Smoke test
+        run: |
+          kubectl -n todo port-forward svc/todo-api 8080:80 &
+          sleep 5
+          ./scripts/smoke-test.sh http://localhost:8080
+
+      - name: Debug info on failure
+        if: failure()
+        run: |
+          kubectl -n todo get all
+          kubectl -n todo describe pods
+          kubectl -n todo logs -l app=todo-api --tail=100 --all-containers || true
+          kubectl -n todo get events --sort-by=.lastTimestamp
+
+  # ─────────────── 5. Production: same image, only after manual approval ───────────────
+  deploy-production:
+    name: Deploy to production
+    needs: [build-image, deploy-test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production                            # add "Required reviewers" on this environment for approval
+    env:
+      IMAGE: ${{ needs.build-image.outputs.image }}
+      KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_PRODUCTION }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy
+        run: |
+          if [ -z "$KUBECONFIG_DATA" ]; then
+            echo "::notice::No KUBECONFIG_PRODUCTION secret set. POC mode: showing what would run."
+            echo "kubectl apply -k k8s/"
+            echo "kubectl -n todo set image deployment/todo-api api=$IMAGE"
+            echo "kubectl -n todo rollout status deployment/todo-api"
+            exit 0
+          fi
+          echo "$KUBECONFIG_DATA" > kubeconfig
+          export KUBECONFIG=$PWD/kubeconfig
+          kubectl apply -k k8s/
+          kubectl -n todo set image deployment/todo-api api="$IMAGE"
+          if ! kubectl -n todo rollout status deployment/todo-api --timeout=300s; then
+            echo "::error::Rollout failed, rolling back"
+            kubectl -n todo rollout undo deployment/todo-api
+            exit 1
+          fi

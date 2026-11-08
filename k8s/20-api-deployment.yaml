@@ -1,0 +1,84 @@
+# Deployment = "I always want N copies of the API running".
+# Kubernetes keeps that true: restarts crashed Pods, replaces deleted ones, rolls out new versions.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: todo-api
+  namespace: todo
+  labels:
+    app: todo-api
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5             # old versions kept for "kubectl rollout undo"
+  selector:
+    matchLabels:
+      app: todo-api                   # must match the Pod labels below
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1                     # at most 1 extra Pod during an update
+      maxUnavailable: 0               # never go below 3 ready Pods -> zero downtime
+  template:
+    metadata:
+      labels:
+        app: todo-api
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: api
+          # The pipeline replaces this with the exact image it built:
+          #   kubectl set image deployment/todo-api api=ghcr.io/<owner>/todo-api:<sha>
+          image: todo-api:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: todo-api-config
+          env:
+            - name: ConnectionStrings__Default
+              valueFrom:
+                secretKeyRef:
+                  name: todo-db-secret
+                  key: ConnectionStrings__Default
+          resources:
+            requests:                 # reserved; the scheduler uses these
+              cpu: 100m
+              memory: 128Mi
+            limits:                   # maximum; above the memory limit -> OOMKilled
+              cpu: 500m
+              memory: 256Mi
+          startupProbe:               # give the app up to 60s to start (waits for the DB)
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:             # fails -> Pod removed from the Service (no traffic), NOT restarted
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:              # fails -> container restarted. Checks the process only, never the DB.
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      affinity:
+        podAntiAffinity:              # prefer spreading copies across different nodes
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: todo-api

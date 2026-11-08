@@ -1,0 +1,11 @@
+# PodDisruptionBudget: during node maintenance (kubectl drain) keep at least 2 API Pods running.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: todo-api
+  namespace: todo
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: todo-api

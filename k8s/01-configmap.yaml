@@ -1,0 +1,11 @@
+# ConfigMap = normal (non-secret) settings, injected as environment variables.
+# Same image in every environment; only these values change.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: todo-api-config
+  namespace: todo
+data:
+  ASPNETCORE_ENVIRONMENT: "Production"
+  App__Greeting: "Hello from a Kubernetes ConfigMap"
+  App__EnableChaos: "true"          # POC demo endpoints (/api/stress, /api/crash). Set to "false" in real environments.
